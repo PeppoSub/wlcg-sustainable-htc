@@ -1,0 +1,20 @@
+[Unit]
+Description=CO2 Intensity Monitor (Prometheus exporter + forecast HTTP server)
+Documentation=https://carbonintensity.org.uk
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=prometheus
+Group=prometheus
+WorkingDirectory="YOUR_WORK_DIR"
+ExecStart=/usr/bin/python3 "YOUR_WORK_DIR"/co2_monitor.py serve
+Restart=on-failure
+RestartSec=30
+TimeoutStopSec=10
+PrivateTmp=true
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

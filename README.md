@@ -33,121 +33,108 @@ This project addresses three problems:
 
 ## Architecture
 
-Worker nodes
-|-- node_exporter (standard metrics)
-|-- node_get_ipmi.sh -> ipminfo.prom (IPMI power + temperature)
-|-- node_get_psinfo.sh -> psinfo.prom (running jobs by VO, from kernel)
-|-- node_get_condorinfo.sh -> condoren.prom (HTCondor slot metrics by VO)
-|-- node_get_audinfo.sh -> audinfo.prom (AUDITOR/PEAR power accounting)
-|
-v
-Prometheus / VictoriaMetrics (central collector)
-|
-+--> Grafana dashboards (real-time display)
-|
-+--> power_plus.py (offline analysis: energy per VO, validation)
-specyplot.py (HS23 throughput efficiency analysis)
+    Worker nodes
+      |-- node_exporter (standard)
+      |-- node_get_ipmi.sh      -> ipminfo.prom   (IPMI power + temperature)
+      |-- node_get_psinfo.sh    -> psinfo.prom    (running jobs by VO, from kernel)
+      |-- node_get_condorinfo.sh -> condoren.prom (HTCondor slot metrics by VO)
+      |-- node_get_audinfo.sh   -> audinfo.prom   (AUDITOR/PEAR power accounting)
+      |-- node_get_static.sh    -> static.prom    (static node info: CPU, RAM, group)
+      |-- node_get_smart.sh     -> smart.prom     (disk SMART health metrics)
+           |
+           v
+    Prometheus / VictoriaMetrics (central collector)
+           |
+           +--> Grafana dashboards (real-time display)
+           |
+           +--> power_plus.py    (energy per VO, IPMI validation)
+                specyplot.py     (HS23 efficiency across frequency points)
+                nodes_history.py (per-node historical analysis)
 
-Carbon Intensity API (api.carbonintensity.org.uk)
-|
-+--> co2_exporter.py -> Prometheus (CO2 forecast metrics)
-|
-+--> Grafana alerting
-|
-+--> co2_freq_manager.yml (Ansible: throttle/reset cluster frequency)
-
+    NESO Carbon Intensity API
+           |
+           +--> co2_monitor.py -> Prometheus (CO2 forecast metrics)
+                     |
+                     +--> Grafana alerting
+                               |
+                               +--> co2_freq_manager.yml (throttle/reset)
 
 ---
 
 ## Components
 
-### 1. Exporters (`exporters/`)
+### Exporters (`exporters/`)
 
-Custom scripts that run as cron jobs on every worker node, writing
-metrics in Prometheus textfile format to the node_exporter collector
-directory (`/var/lib/node_exporter/textfile_collector/`).
+Custom scripts running as cron jobs on every worker node, writing
+Prometheus textfile metrics to EXPORTER_DIR (see docs/configuration.md).
 
 | Script | Output | Description |
 |---|---|---|
 | `node_get_ipmi.sh` | `ipminfo.prom` | IPMI power (W) and ambient temperature |
-| `node_get_psinfo.sh` | `psinfo.prom` | Running jobs per VO (from kernel ps) |
+| `node_get_psinfo.sh` | `psinfo.prom` | Running jobs per VO from kernel ps |
 | `node_get_condorinfo.sh` | `condoren.prom` | HTCondor slot metrics per VO and CE |
 | `node_get_audinfo.sh` | `audinfo.prom` | AUDITOR/PEAR power accounting metrics |
+| `node_get_static.sh` | `static.prom` | Static node info: CPU model, RAM, hardware group label |
+| `node_get_smart.sh` | `smart.prom` | Disk SMART health metrics |
 
-All scripts are designed for RHEL-family systems with HTCondor and
-ipmitool installed. Cron configuration:
+Cron configuration (all scripts, every minute):
 
-```cron
-*/1 * * * * /var/lib/node_exporter/node_get_ipmi.sh
-*/1 * * * * /var/lib/node_exporter/node_get_psinfo.sh
-*/1 * * * * /var/lib/node_exporter/node_get_condorinfo.sh
-*/1 * * * * /var/lib/node_exporter/node_get_audinfo.sh
-```
+    */1 * * * * /var/lib/node_exporter/<script>.sh
 
-**Adapting to your site:** the VO list in `node_get_psinfo.sh` and
-`node_get_condorinfo.sh` must be updated to match your supported VOs.
-Hardware group names in `power_plus.py` must match your Prometheus labels.
+Adapt the VO list in node_get_psinfo.sh and node_get_condorinfo.sh
+to match your site. See docs/configuration.md.
 
-### 2. Analysis (`analysis/`)
+
+### Analysis (`analysis/`)
 
 Offline Python scripts for energy accounting and efficiency analysis.
 
-**`power_plus.py`**: queries Prometheus or VictoriaMetrics via the API,
-aggregates core usage by VO and hardware series, estimates energy per VO
-by multiplying slot usage by measured per-core power, and validates
-against direct IPMI measurements. Outputs a text report and PNG plots.
+| Script | Description |
+|---|---|
+| `power_plus.py` | Queries Prometheus/VictoriaMetrics API, aggregates energy per VO and hardware group, validates against IPMI measurements, outputs report and plots |
+| `specyplot.py` | HS23 benchmark throughput across hardware generations and CPU frequency operating points |
+| `nodes_history.py` | Per-node historical metrics analysis and plotting |
 
-```bash
-python power_plus.py          # default: last 4 weeks
-python power_plus.py 8        # last 8 weeks
-```
+    python power_plus.py       # default: last 4 weeks
+    python power_plus.py 8     # last 8 weeks
 
-**`specyplot.py`** and **`claude_history.py`**: analysis of HS23
-benchmark throughput across hardware generations and CPU frequency
-operating points, used to quantify the efficiency trade-off of frequency
-throttling. These scripts produced the benchmark data underpinning the
-Watt Matters results (see Publications below).
 
-### 3. CO2 Management (`co2-management/`)
+### CO2 Management (`co2_management/`)
 
-Tools for tracking electricity grid carbon intensity and adjusting
-cluster CPU frequency accordingly.
-
-**`co2_exporter.py`**: fetches 24-hour carbon intensity forecasts from
-the National Energy System Operator (NESO) API for the relevant grid
-region, exports them as Prometheus metrics, and handles the
-forward-timestamped nature of forecast data (using the Grafana Infinity
-plugin for storage).
-
-**`co2_freq_manager.yml`**: Ansible playbook that implements two modes:
-- `throttle`: sets CPUs to a mid-frequency operating point across
-  targeted hardware groups when carbon intensity exceeds threshold
-- `reset`: restores default (maximum) frequency
-
-All runs are intentional and manual: WLCG pilot jobs cannot be
-interrupted, so automated scheduling is out of scope. The playbook is
-invoked by a human operator following Grafana alerts.
-
-**Key finding (Watt Matters, CHEP 2026):** at the mid-frequency
-operating point, power consumption drops by approximately X% with a
-throughput (HS23) reduction of approximately Y%. During high-carbon
-periods, the CO2 reduction per kWh saved outweighs the throughput cost.
-Scotland's grid was consistently below threshold during the study period,
-so results are presented as counterfactual estimates validated against
-two measured baselines. [fill in X and Y]
-
-### 4. Dashboards (`dashboards/`)
-
-Grafana dashboard JSON exports for direct import:
+See co2_management/README.md for full description.
 
 | File | Description |
 |---|---|
-| `cluster_overview.json` | Site-wide cluster throughput and power efficiency |
-| `htc_jobs.json` | Per-VO and per-instance HTCondor job metrics |
-| `node_monitor.json` | Single-node detail view |
+| `co2_monitor.py` | Fetches NESO carbon intensity forecasts, exports to Prometheus, runs as a systemd service |
+| `co2_monitor.service` | systemd unit file for deployment (Ansible-ready) |
+| `co2_freq_manager.yml` | Ansible playbook: throttle or reset cluster CPU frequency based on carbon intensity |
+| `plot_intensity.py` | Standalone plots of forecast vs. actual carbon intensity |
 
-Built on Prometheus/VictoriaMetrics. The Grafana Infinity plugin is
-required for CO2 forecast visualisation.
+
+### Dashboards (`dashboards/`)
+
+Grafana dashboard JSON exports, ready to import.
+Requires Prometheus datasource configured (see docs/configuration.md for UID setup).
+The CO2 intensity dashboard additionally requires the Grafana Infinity plugin.
+
+| File | Description |
+|---|---|
+| `A9-NewClusOv.json` | Site-wide cluster throughput and power efficiency overview |
+| `A9-HTcMon.json` | Per-VO and per-instance HTCondor job metrics |
+| `A9-NodMon.json` | Single-node detail view |
+| `CO2int.json` | Carbon intensity forecast and alerting dashboard |
+
+
+### Benchmarks (`benchmarks/`)
+
+Utility scripts for hardware characterisation and stress testing.
+
+| Script | Description |
+|---|---|
+| `jdump.sh` | Dumps IPMI and system hardware info for a node |
+| `jget.sh` | Retrieves and parses hardware metrics from a set of nodes |
+| `rampUp.sh` | CPU stress ramp-up script for power baseline measurement |
+| `runAny_frqscan.sh` | Runs a benchmark across a range of CPU frequency settings, used to generate the HS23-vs-frequency curves underpinning the CO2 throttling strategy |
 
 ---
 

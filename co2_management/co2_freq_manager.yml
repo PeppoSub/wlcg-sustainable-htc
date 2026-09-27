@@ -1,0 +1,113 @@
+## CO2-aware CPU frequency manager by Claude.ai & Emanuele - v0.1
+## (https://claude.ai/chat/26c419e2-cf23-4692-9c54-9bdf4d75bd7c) 
+##
+## Two modes, selected via -e "mode=throttle|reset":
+##
+##   throttle  — sets Userspace governor + node-specific reduced frequency
+##   reset     — lifts all frequency limits + sets Conservative governor
+##
+## General usage:
+##   $ cd /etc/ansible
+## During peak CO2 hours: throttle all nodes to their optimal frequency
+##   $ ansible-playbook playbooks/co2_freq_manager.yml -e "mode=throttle"
+## After peak: restore full dynamic scaling
+##   $ ansible-playbook playbooks/co2_freq_manager.yml -e "mode=reset"
+## Check current state across all nodes
+##   $ ansible compute -m shell -a "cpupower frequency-info" | grep "current CPU frequency:"
+##
+## Cron examples (add to root's crontab with: sudo crontab -e):
+##
+##   0 17 * * 1-5  cd /etc/ansible && ansible-playbook playbooks/co2_freq_manager.yml -e "mode=throttle" >> /var/log/co2_freq.log 2>&1
+##   0 21 * * 1-5  cd /etc/ansible && ansible-playbook playbooks/co2_freq_manager.yml -e "mode=reset"    >> /var/log/co2_freq.log 2>&1
+##
+---
+- name: CO2-aware CPU frequency management
+  hosts: compute   
+  # hosts: d20,d21,d22,h16,h17,m24,a23
+  # become: true
+
+  tasks:
+
+    # ── guard ────────────────────────────────────────────────────────────────
+    - name: Abort if mode is not set correctly
+      fail:
+        msg: "Please pass -e 'mode=throttle' or -e 'mode=reset'"
+      when: mode is not defined or mode not in ['throttle', 'reset']
+      run_once: true
+
+    # ════════════════════════════════════════════════════════════════════════
+    # THROTTLE: Userspace governor + reduced node-specific frequency
+    # ════════════════════════════════════════════════════════════════════════
+
+    - name: "[throttle] Set frequency ceiling to node limit (allow userspace to work)"
+      command: cpupower frequency-set -u "{{ node_freq }}"
+      when: mode == 'throttle'
+
+    - name: "[throttle] Set frequency floor to node limit (pin, not just cap)"
+      command: cpupower frequency-set -d "{{ node_freq }}"
+      when: mode == 'throttle'
+
+    - name: "[throttle] Switch to Userspace governor"
+      command: cpupower frequency-set -g userspace
+      when: mode == 'throttle'
+
+    - name: "[throttle] Set target frequency"
+      command: cpupower frequency-set -f "{{ node_freq }}"
+      when: mode == 'throttle'
+
+    # ════════════════════════════════════════════════════════════════════════
+    # RESET: lift all limits + Conservative governor (OS manages dynamically)
+    # ════════════════════════════════════════════════════════════════════════
+
+    - name: "[reset] Lift frequency ceiling"
+      command: cpupower frequency-set -u 99GHz
+      when: mode == 'reset'
+
+    - name: "[reset] Lift frequency floor"
+      command: cpupower frequency-set -d 1MHz
+      when: mode == 'reset'
+
+    - name: "[reset] Switch to Conservative governor"
+      command: cpupower frequency-set -g conservative
+      when: mode == 'reset'
+
+    # ════════════════════════════════════════════════════════════════════════
+    # VERIFY: always report current state after any change
+    # ════════════════════════════════════════════════════════════════════════
+
+    - name: Read current governor
+      command: cpupower frequency-info -p
+      register: gov_out
+      changed_when: false
+
+    - name: Read current frequency
+      command: cpupower frequency-info -f
+      register: freq_out
+      changed_when: false
+
+    - name: Report state
+      debug:
+        msg: |
+          [{{ inventory_hostname }}]  mode={{ mode }}  target={{ node_freq if mode == 'throttle' else 'no limit' }}
+            governor : {{ gov_out.stdout  | regex_search('The governor "[^"]*"') }}
+            frequency: {{ freq_out.stdout | regex_search('[0-9.]+ [kMG]Hz \(asserted.*\)') }}
+
+  vars:
+    # ── per-node throttled frequency ─────────────────────────────────────────
+    # Edit these values if hardware changes or you want a different setpoint.
+    freq_map:
+      d20: "2GHz"
+      d21: "2GHz"
+      d22: "2GHz"
+      h16: "2GHz"
+      h17: "2GHz"
+      m24: "2.3GHz"
+      a23: "2.4GHz"
+
+    # Extract node-type slug from hostname, e.g. wn-d20-001 -> d20
+    node_type: "{{ inventory_hostname | regex_replace('^wn-([a-z0-9]+)-.*$', '\\1') }}"
+
+    # Resolved frequency for the current host
+    node_freq: "{{ freq_map[node_type] }}"
+
+...
